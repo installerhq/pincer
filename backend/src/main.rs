@@ -1,5 +1,6 @@
-use mailcrab::{Error, MailMessage, MessageId, Result, mail_server};
+use mailcrab::{Error, MailMessage, MailMessageMetadata, MessageId, Result, mail_server};
 use rust_embed::{EmbeddedFile, RustEmbed};
+use serde::Serialize;
 use std::{
     collections::HashMap,
     env,
@@ -8,13 +9,24 @@ use std::{
     str::FromStr,
     sync::{Arc, RwLock},
 };
-use tokio::{signal, sync::broadcast::Receiver, task::JoinSet, time::Duration};
+use tokio::{
+    signal,
+    sync::broadcast::{Receiver, Sender},
+    task::JoinSet,
+    time::Duration,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
+use uuid::Uuid;
 
-use crate::{storage::storage, web_server::web_server};
+use crate::{
+    sinch::{Registration, SinchConfig, SinchInfo, SmsMessage, sinch_server},
+    storage::storage,
+    web_server::web_server,
+};
 
+mod sinch;
 mod storage;
 mod web_server;
 
@@ -25,10 +37,29 @@ mod tests;
 /// when compiling without cargo
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// events pushed to websocket clients, mail arrives on its own queue from the
+/// SMTP server and is wrapped in `Event::Mail` before sending
+#[derive(Clone, Debug, Serialize)]
+pub enum Event {
+    Mail(MailMessageMetadata),
+    /// a new or updated SMS
+    Sms(SmsMessage),
+    /// a new or updated sender ID registration
+    Registration(Registration),
+    Removed(Uuid),
+    /// the Sinch mock settings changed
+    Settings(SinchInfo),
+}
+
 /// application state, holds all messages, a message queue and configuration
 pub struct AppState {
     rx: Receiver<MailMessage>,
+    events: Sender<Event>,
     storage: RwLock<HashMap<MessageId, MailMessage>>,
+    sms: RwLock<HashMap<Uuid, SmsMessage>>,
+    registrations: RwLock<HashMap<Uuid, Registration>>,
+    sinch: SinchConfig,
+    http: reqwest::Client,
     prefix: String,
     index: Option<String>,
     retention_period: Duration,
@@ -82,16 +113,26 @@ async fn run() -> i32 {
     // optional retention period, the default is 0 - which means messages are kept forever
     let retention_period: u64 = parse_env_var("MAILCRAB_RETENTION_PERIOD", 0);
 
+    let sinch = SinchConfig::from_env(http_host);
+
     info!(
-        "MailCrab HTTP server starting on {http_host}:{http_port} and SMTP server on {smtp_host}:{smtp_port}"
+        "Pincer HTTP server starting on {http_host}:{http_port}, SMTP server on {smtp_host}:{smtp_port} and Sinch mock on {}:{}",
+        sinch.host, sinch.port
     );
 
-    // initialize internal broadcast queue
+    // initialize internal broadcast queues
     let (tx, rx) = tokio::sync::broadcast::channel::<MailMessage>(queue_capacity);
+    // every SMS results in multiple events (accepted, delivery reports), so use a larger queue
+    let (events, _) = tokio::sync::broadcast::channel::<Event>(queue_capacity.max(1024));
     let storage_rx = rx.resubscribe();
     let app_state = Arc::new(AppState {
         rx,
+        events,
         storage: Default::default(),
+        sms: Default::default(),
+        registrations: Default::default(),
+        sinch,
+        http: reqwest::Client::new(),
         index: load_index(&prefix).ok(),
         prefix,
         retention_period: Duration::from_secs(retention_period),
@@ -104,6 +145,8 @@ async fn run() -> i32 {
     let token = CancellationToken::new();
     let abort_token = CancellationToken::new();
     let mut set = JoinSet::new();
+    let shutdown = token.clone();
+    let mut exit_code = 0;
 
     set.spawn(storage(storage_rx, state, token.clone()));
     set.spawn(mail_server(
@@ -113,6 +156,7 @@ async fn run() -> i32 {
         enable_tls_auth,
         token.clone(),
     ));
+    set.spawn(sinch_server(app_state.clone(), token.clone()));
     set.spawn(web_server(http_host, http_port, app_state, token.clone()));
 
     tokio::spawn({
@@ -129,17 +173,27 @@ async fn run() -> i32 {
     loop {
         tokio::select! {
             r = set.join_next() => match r {
-                Some(Ok(_)) => {},
+                Some(Ok(Ok(_))) => {},
+                // e.g. a port that is already in use, do not keep running without it
+                Some(Ok(Err(e))) => {
+                    error!("{e}");
+                    shutdown.cancel();
+                    exit_code = 1;
+                },
                 Some(Err(e)) => error!("{e}"),
                 None => {
-                    info!("MailCrab graceful shutdown successful");
+                    if exit_code == 0 {
+                        info!("Pincer graceful shutdown successful");
+                    } else {
+                        error!("Pincer stopped because a server could not run");
+                    }
 
-                    return 0;
+                    return exit_code;
                 },
             },
             _ = abort_token.cancelled() => {
                 set.abort_all();
-                error!("MailCrab service aborted");
+                error!("Pincer service aborted");
 
                 return 1;
             }

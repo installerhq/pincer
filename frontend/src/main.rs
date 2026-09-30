@@ -7,6 +7,8 @@ mod list;
 mod message_header;
 mod overview;
 mod plaintext;
+mod settings;
+mod sinch_view;
 mod types;
 mod view;
 mod websocket;

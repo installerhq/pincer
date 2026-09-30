@@ -44,6 +44,8 @@ spec:
               value: {{ .Values.service.containerPort | quote }}
             - name: SMTP_PORT
               value: {{ .Values.service.smtpPort | quote }}
+            - name: SINCH_PORT
+              value: {{ .Values.service.sinchPort | quote }}
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -53,6 +55,9 @@ spec:
               protocol: TCP
             - name: smtp
               containerPort: {{ .Values.service.smtpPort }}
+              protocol: TCP
+            - name: sinch
+              containerPort: {{ .Values.service.sinchPort }}
               protocol: TCP
           {{- with .Values.livenessProbe }}
           livenessProbe:

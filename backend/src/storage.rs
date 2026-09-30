@@ -50,6 +50,18 @@ pub(crate) async fn storage(
                         }
 
                     });
+
+                    if let Ok(mut sms) = state.sms.write() {
+                        sms.retain(|_, sms| {
+                            if sms.time > remove_before {
+                                true
+                            } else {
+                                info!("Removing old SMS {} to {}", sms.message_id, sms.to);
+
+                                false
+                            }
+                        });
+                    }
                 }
             },
             _ = token.cancelled() => {

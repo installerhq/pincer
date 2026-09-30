@@ -209,8 +209,249 @@ async fn functional() {
     let expected: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
     assert_eq!(attachment_bytes.as_ref(), expected.as_slice());
 
+    test_sms().await;
+
     // stop the server
     join.abort();
+}
+
+/// send an SMS through the Sinch mock and receive its delivery reports
+async fn test_sms() {
+    let http_port: u16 = parse_env_var("HTTP_PORT", 1080);
+    let sinch_port: u16 = parse_env_var("SINCH_PORT", 1090);
+    let client = Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    // a webhook target that forwards received callbacks to the test
+    let (callback_tx, mut callback_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(8);
+    let callback_app = axum::Router::new().route(
+        "/status",
+        axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let callback_tx = callback_tx.clone();
+            async move {
+                callback_tx.send(body).await.unwrap();
+                axum::http::StatusCode::NO_CONTENT
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let callback_url = format!("http://{}/status", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, callback_app).await });
+
+    let token: serde_json::Value = client
+        .post(format!("http://127.0.0.1:{sinch_port}/oauth2/token"))
+        .basic_auth("key", Some("secret"))
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("grant_type=client_credentials")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = token["access_token"].as_str().unwrap();
+
+    let sent: serde_json::Value = client
+        .post(format!(
+            "http://127.0.0.1:{sinch_port}/v1/projects/project/messages:send"
+        ))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "app_id": "app",
+            "recipient": { "identified_by": { "channel_identities": [
+                { "channel": "SMS", "identity": "+4791234567" }
+            ]}},
+            "message": { "text_message": { "text": "Hello from the test" } },
+            "channel_properties": { "SMS_SENDER": "Pincer" },
+            "message_metadata": "{\"orderId\":\"order\"}",
+            "callback_url": callback_url,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let message_id = sent["message_id"].as_str().unwrap();
+    assert_eq!(message_id.len(), 26);
+
+    let messages: Vec<serde_json::Value> = client
+        .get(format!("http://127.0.0.1:{http_port}/api/sms"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(messages.iter().any(|m| m["message_id"] == message_id));
+
+    for expected in ["QUEUED_ON_CHANNEL", "DELIVERED"] {
+        let callback = tokio::time::timeout(Duration::from_secs(5), callback_rx.recv())
+            .await
+            .expect("delivery report not received within timeout")
+            .unwrap();
+        let report = &callback["message_delivery_report"];
+        assert_eq!(report["status"], expected);
+        assert_eq!(report["message_id"], message_id);
+        assert_eq!(report["metadata"], "{\"orderId\":\"order\"}");
+    }
+
+    // send an SMS and return its internal id
+    let send = |recipient: serde_json::Value| {
+        let client = client.clone();
+        let callback_url = callback_url.clone();
+        async move {
+            let sent: serde_json::Value = client
+                .post(format!(
+                    "http://127.0.0.1:{sinch_port}/v1/projects/project/messages:send"
+                ))
+                .bearer_auth("token")
+                .json(&serde_json::json!({
+                    "app_id": "app",
+                    "recipient": recipient,
+                    "message": { "text_message": { "text": "Rules" } },
+                    "callback_url": callback_url,
+                }))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let messages: Vec<serde_json::Value> = client
+                .get(format!("http://127.0.0.1:{http_port}/api/sms"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            messages
+                .iter()
+                .find(|m| m["message_id"] == sent["message_id"])
+                .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+    let sms_number = |number: &str| {
+        serde_json::json!({ "identified_by": { "channel_identities": [
+            { "channel": "SMS", "identity": number }
+        ]}})
+    };
+    let finalize = |id: String, status: &'static str| {
+        let client = client.clone();
+        async move {
+            client
+                .post(format!(
+                    "http://127.0.0.1:{http_port}/api/sms/{id}/status/{status}"
+                ))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    let mut next_status = async || {
+        let callback = tokio::time::timeout(Duration::from_secs(5), callback_rx.recv())
+            .await
+            .expect("delivery report not received within timeout")
+            .unwrap();
+        callback["message_delivery_report"]["status"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+
+    // numbers ending in 0001 fail
+    send(sms_number("+4791230001")).await;
+    assert_eq!(next_status().await, "QUEUED_ON_CHANNEL");
+    assert_eq!(next_status().await, "FAILED");
+
+    // numbers ending in 0002 stay pending until finalized from the UI, once
+    let id = send(sms_number("+4791230002")).await;
+    assert_eq!(next_status().await, "QUEUED_ON_CHANNEL");
+    assert_eq!(finalize(id.clone(), "DELIVERED").await, 200);
+    assert_eq!(next_status().await, "DELIVERED");
+    assert_eq!(finalize(id.clone(), "FAILED").await, 409);
+    assert_eq!(finalize(id, "QUEUED_ON_CHANNEL").await, 400);
+
+    // settings changed from the web interface apply to new messages
+    let mut info: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{http_port}/api/sinch"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    info["settings"]["dlr_delay_ms"] = 100.into();
+    info["settings"]["dlr_rules"] = serde_json::json!([{ "suffix": "4567", "outcome": "failed" }]);
+    let status = client
+        .put(format!("http://127.0.0.1:{http_port}/api/sinch/settings"))
+        .json(&info["settings"])
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 200);
+    send(sms_number("+4791234567")).await;
+    assert_eq!(next_status().await, "QUEUED_ON_CHANNEL");
+    assert_eq!(next_status().await, "FAILED");
+
+    info["settings"]["webhook_url"] = "not a url".into();
+    let status = client
+        .put(format!("http://127.0.0.1:{http_port}/api/sinch/settings"))
+        .json(&info["settings"])
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 400);
+
+    // finalizing before the automatic reports sends QUEUED_ON_CHANNEL first and
+    // stops the automatic reports
+    let id = send(serde_json::json!({ "contact_id": "contact" })).await;
+    assert_eq!(finalize(id, "FAILED").await, 200);
+    assert_eq!(next_status().await, "QUEUED_ON_CHANNEL");
+    assert_eq!(next_status().await, "FAILED");
+    let more = tokio::time::timeout(Duration::from_millis(2500), callback_rx.recv()).await;
+    assert!(more.is_err(), "no reports after the final report");
+
+    // SMS can be deleted through the REST API like email
+    let messages: Vec<serde_json::Value> = client
+        .get(format!("http://127.0.0.1:{http_port}/api/sms"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = messages[0]["id"].as_str().unwrap();
+    for expected in [200, 404] {
+        let status = client
+            .post(format!("http://127.0.0.1:{http_port}/api/delete/{id}"))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, expected);
+    }
+
+    // requests without credentials are rejected
+    let status = client
+        .post(format!(
+            "http://127.0.0.1:{sinch_port}/v1/projects/project/messages:send"
+        ))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 401);
 }
 
 #[tokio::test]
