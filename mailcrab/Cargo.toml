@@ -1,10 +1,10 @@
 [package]
 name = "mailcrab"
-version = "1.10.0"
+version = "1.11.0"
 edition = "2024"
 publish = true
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/tweedegolf/mailcrab"
+repository = "https://github.com/installerhq/pincer"
 description = "Email test server for development, written in Rust"
 
 [dependencies]

@@ -15,5 +15,9 @@ spec:
       targetPort: smtp
       protocol: TCP
       name: smtp
+    - port: {{ .Values.service.sinchPort }}
+      targetPort: sinch
+      protocol: TCP
+      name: sinch
   selector:
     {{- include "mailcrab.selectorLabels" . | nindent 4 }}

@@ -19,7 +19,7 @@ replicaCount: 1
 
 image:
   # -- Image to use for the deployment.
-  repository: docker.io/marlonb/mailcrab
+  repository: ghcr.io/installerhq/pincer
   # -- Specify an imagePullPolicy, defaults to 'Always' if image tag is 'latest', else set to 'IfNotPresent'
   pullPolicy: Always
   # -- Overrides the image tag whose default is the chart appVersion.
@@ -75,6 +75,8 @@ service:
   containerPort: 1080
   # -- The container/service port the SMTP server listens on (sets the SMTP_PORT env var).
   smtpPort: 1025
+  # -- The container/service port the Sinch API mock listens on (sets the SINCH_PORT env var).
+  sinchPort: 1090
 
 ingress:
   # -- Enables the use of an ingress controller.
@@ -121,8 +123,8 @@ readinessProbe:
     path: /
     port: http
 
-# -- Extra environment variables to pass to the MailCrab container.
-# Ref: https://github.com/tweedegolf/mailcrab#configuration
+# -- Extra environment variables to pass to the Pincer container, e.g. the SINCH_* settings.
+# Ref: https://github.com/installerhq/pincer#configuration
 # For example:
 #   - name: MAILCRAB_RETENTION_PERIOD
 #     value: "3600"

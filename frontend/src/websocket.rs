@@ -6,11 +6,11 @@ use gloo_console::error;
 use gloo_net::websocket::{self, futures::WebSocket};
 use wasm_bindgen_futures::spawn_local;
 
-use crate::types::{Action, MailMessageMetadata};
+use crate::types::{Action, Event};
 
 pub struct WebsocketService {
     pub sender: Sender<Action>,
-    pub receiver: Receiver<MailMessageMetadata>,
+    pub receiver: Receiver<Event>,
 }
 
 impl WebsocketService {
@@ -32,8 +32,7 @@ impl WebsocketService {
 
         let (mut write, mut read) = ws.split();
         let (ws_sender, mut ws_receiver) = futures::channel::mpsc::channel::<Action>(32);
-        let (mut message_sender, message_receiver) =
-            futures::channel::mpsc::channel::<MailMessageMetadata>(32);
+        let (mut message_sender, message_receiver) = futures::channel::mpsc::channel::<Event>(32);
 
         // forward messages over websocket to server
         spawn_local(async move {
@@ -57,7 +56,7 @@ impl WebsocketService {
         spawn_local(async move {
             while let Some(msg) = read.next().await {
                 if let Ok(websocket::Message::Text(data)) = msg
-                    && let Ok(message) = serde_json_wasm::from_str::<MailMessageMetadata>(&data)
+                    && let Ok(message) = serde_json_wasm::from_str::<Event>(&data)
                     && message_sender.send(message).await.is_err()
                 {
                     error!("Error queuing message");

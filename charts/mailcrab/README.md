@@ -2,7 +2,7 @@
 
 ![Version: 0.2.1](https://img.shields.io/badge/Version-0.2.1-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 1.9.0](https://img.shields.io/badge/AppVersion-1.9.0-informational?style=flat-square)
 
-A Helm chart for deploying MailCrab in Kubernetes.
+A Helm chart for deploying Pincer (email and SMS test server, a MailCrab fork) in Kubernetes.
 
 ## Values
 
@@ -14,10 +14,10 @@ A Helm chart for deploying MailCrab in Kubernetes.
 | autoscaling.maxReplicas | int | `5` | Maximum number of replicas when autoscaling is enabled. |
 | autoscaling.targetCPUUtilizationPercentage | int | `80` | Target average CPU utilization percentage. Set to `null` to disable. |
 | autoscaling.targetMemoryUtilizationPercentage | int | `nil` | Target average memory utilization percentage. Set to `null` to disable. |
-| env | list | `[]` | Extra environment variables to pass to the MailCrab container. See https://github.com/tweedegolf/mailcrab#configuration |
+| env | list | `[]` | Extra environment variables to pass to the Pincer container, e.g. the SINCH_* settings. See https://github.com/installerhq/pincer#configuration |
 | fullnameOverride | string | `""` | Configure the fullname override for resources. |
 | image.pullPolicy | string | `"Always"` | Specify an imagePullPolicy, defaults to 'Always' if image tag is 'latest', else set to 'IfNotPresent' |
-| image.repository | string | `"docker.io/marlonb/mailcrab"` | Image to use for the deployment. |
+| image.repository | string | `"ghcr.io/installerhq/pincer"` | Image to use for the deployment. |
 | image.tag | string | `"latest"` | Overrides the image tag whose default is the chart appVersion. |
 | imagePullSecrets | list | `[]` | If needed, specify custom imagePullSecrets to use with private registries. |
 | ingress.annotations | object | `{}` | Annotations to add to the ingress |
@@ -41,6 +41,7 @@ A Helm chart for deploying MailCrab in Kubernetes.
 | service.containerPort | int | `1080` | The container port the web interface listens on (sets the HTTP_PORT env var). |
 | service.port | int | `80` | The port to expose on the service for the web interface. |
 | service.smtpPort | int | `1025` | The container/service port the SMTP server listens on (sets the SMTP_PORT env var). |
+| service.sinchPort | int | `1090` | The container/service port the Sinch API mock listens on (sets the SINCH_PORT env var). |
 | service.type | string | `"ClusterIP"` | The type of service to create. |
 | serviceAccount.annotations | object | `{}` | Annotations to add to the service account |
 | serviceAccount.create | bool | `true` | Specifies whether a service account should be created |

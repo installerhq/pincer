@@ -7,7 +7,7 @@ use axum::{
     },
     http::{StatusCode, Uri, header},
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use mailcrab::{Action, Error, MailMessage, MailMessageMetadata, Result as AppResult};
 use serde::Serialize;
@@ -16,26 +16,106 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
 };
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::broadcast::error::RecvError};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::{AppState, Asset, VERSION};
+use crate::{
+    AppState, Asset, Event, VERSION,
+    sinch::{
+        FINAL_STATUSES, Registration, SinchInfo, SinchSettings, SmsMessage,
+        conversation::{FinalizeError, finalize},
+        registration::{REGISTRATION_STATUSES, SetStatusError, set_status},
+    },
+};
 
 #[derive(Debug, Serialize)]
 struct VersionInfo {
     version_be: String,
 }
 
-/// send mail message metadata to websocket clients when broadcaster by the SMTP server
+/// serialize an event and send it to a websocket client, returns false when the client is gone
+async fn send_event(socket: &mut WebSocket, event: &Event) -> bool {
+    match serde_json::to_string(event) {
+        Ok(json) => {
+            if socket.send(ws::Message::Text(json.into())).await.is_err() {
+                info!("WS client disconnected");
+                return false;
+            }
+        }
+        Err(e) => {
+            error!("could not convert event to json {:?}", e);
+        }
+    }
+
+    true
+}
+
+/// handle actions from the UI, these apply to mail, SMS and registrations alike
+fn handle_action(state: &AppState, action: Action) {
+    match action {
+        Action::RemoveAll => {
+            if let Ok(mut storage) = state.storage.write() {
+                storage.clear();
+            }
+            if let Ok(mut sms) = state.sms.write() {
+                sms.clear();
+            }
+            if let Ok(mut registrations) = state.registrations.write() {
+                registrations.clear();
+            }
+            info!("storage cleared");
+        }
+        Action::Open(id) => {
+            if let Ok(mut storage) = state.storage.write()
+                && let Some(message) = storage.get_mut(&id)
+            {
+                message.open();
+            } else if let Ok(mut sms) = state.sms.write()
+                && let Some(sms) = sms.get_mut(&id)
+            {
+                sms.opened = true;
+            } else if let Ok(mut registrations) = state.registrations.write()
+                && let Some(registration) = registrations.get_mut(&id)
+            {
+                registration.opened = true;
+            }
+            info!("message {} opened", &id);
+        }
+        Action::Remove(id) => {
+            remove(state, id);
+        }
+    }
+}
+
+/// remove an email, SMS or registration, returns false when nothing was found
+fn remove(state: &AppState, id: Uuid) -> bool {
+    let removed = state
+        .storage
+        .write()
+        .is_ok_and(|mut s| s.remove(&id).is_some())
+        || state.sms.write().is_ok_and(|mut s| s.remove(&id).is_some())
+        || state
+            .registrations
+            .write()
+            .is_ok_and(|mut s| s.remove(&id).is_some());
+    if removed {
+        info!("message {} removed", &id);
+    }
+
+    removed
+}
+
+/// send mail, SMS and registration events to websocket clients
 async fn ws_handler(
     ws: WebSocketUpgrade,
     Extension(state): Extension<Arc<AppState>>,
 ) -> impl IntoResponse {
     ws.on_upgrade(|mut socket: WebSocket| async move {
         let mut receive = state.rx.resubscribe();
+        let mut events = state.events.subscribe();
         let mut active = true;
         let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
 
@@ -50,18 +130,24 @@ async fn ws_handler(
                 internal_received = receive.recv() => {
                     match internal_received {
                         Ok(message) => {
-                            let metadata: MailMessageMetadata = message.into();
-                            match serde_json::to_string(&metadata) {
-                                Ok(json) => {
-                                    if socket.send(ws::Message::Text(json.into())).await.is_err() {
-                                        info!("WS client disconnected");
-                                        active = false;
-                                    }
-                                },
-                                Err(e) => {
-                                    error!("could not convert message to json {:?}", e);
-                                }
-                            }
+                            active = send_event(&mut socket, &Event::Mail(message.into())).await;
+                        },
+                        Err(RecvError::Lagged(skipped)) => {
+                            warn!("websocket client lagging, skipped {skipped} messages");
+                        },
+                        Err(e) => {
+                            error!("event pipeline error {:?}", e);
+                            active = false;
+                        }
+                    }
+                },
+                event = events.recv() => {
+                    match event {
+                        Ok(event) => {
+                            active = send_event(&mut socket, &event).await;
+                        },
+                        Err(RecvError::Lagged(skipped)) => {
+                            warn!("websocket client lagging, skipped {skipped} events");
                         },
                         Err(e) => {
                             error!("event pipeline error {:?}", e);
@@ -73,20 +159,8 @@ async fn ws_handler(
                     match socket_received {
                         Some(Ok(ws::Message::Text(action))) => {
                             match serde_json::from_str(action.as_str()) {
-                                Ok(Action::RemoveAll) => if let Ok(mut storage) = state.storage.write() {
-                                    storage.clear();
-                                    info!("storage cleared");
-                                },
-                                Ok(Action::Open(id)) => if let Ok(mut storage) = state.storage.write() && let Some(message) = storage.get_mut(&id) {
-                                    message.open();
-                                    info!("message {} opened", &id);
-                                },
-                                Ok(Action::Remove(id)) => if let Ok(mut storage) = state.storage.write() && storage.remove(&id).is_some() {
-                                    info!("message {} removed", &id);
-                                },
-                                msg => {
-                                    warn!("unknown action {:?}", msg);
-                                },
+                                Ok(action) => handle_action(&state, action),
+                                Err(e) => warn!("unknown action {:?}", e),
                             }
                         },
                         Some(Ok(ws::Message::Pong(_))) => {
@@ -162,32 +236,103 @@ async fn message_body_handler(
 async fn message_delete_handler(
     Path(id): Path<Uuid>,
     Extension(state): Extension<Arc<AppState>>,
-) -> Result<StatusCode, StatusCode> {
-    if let Ok(mut storage) = state.storage.write() {
-        if storage.remove(&id).is_some() {
-            info!("message {} removed", &id);
-
-            Ok(StatusCode::OK)
-        } else {
-            Err(StatusCode::NOT_FOUND)
-        }
+) -> StatusCode {
+    if remove(&state, id) {
+        StatusCode::OK
     } else {
-        Err(StatusCode::INTERNAL_SERVER_ERROR)
+        StatusCode::NOT_FOUND
     }
 }
 
 /// delete all messages
-async fn message_delete_all_handler(
-    Extension(state): Extension<Arc<AppState>>,
-) -> Result<StatusCode, StatusCode> {
-    if let Ok(mut storage) = state.storage.write() {
-        storage.clear();
-        info!("storage cleared");
+async fn message_delete_all_handler(Extension(state): Extension<Arc<AppState>>) -> StatusCode {
+    handle_action(&state, Action::RemoveAll);
 
-        Ok(StatusCode::OK)
-    } else {
-        Err(StatusCode::INTERNAL_SERVER_ERROR)
+    StatusCode::OK
+}
+
+/// return all SMS messages
+async fn sms_list_handler(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<Vec<SmsMessage>>, StatusCode> {
+    let storage = state
+        .sms
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut messages = storage.values().cloned().collect::<Vec<_>>();
+    messages.sort_by_key(|m| m.time);
+
+    Ok(Json(messages))
+}
+
+/// return all sender ID registrations
+async fn registrations_handler(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<Vec<Registration>>, StatusCode> {
+    let storage = state
+        .registrations
+        .read()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut registrations = storage.values().cloned().collect::<Vec<_>>();
+    registrations.sort_by_key(|r| r.time);
+
+    Ok(Json(registrations))
+}
+
+/// send the final delivery report for a pending SMS, only one final report is ever sent
+async fn sms_status_handler(
+    Path((id, status)): Path<(Uuid, String)>,
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<SmsMessage>, StatusCode> {
+    let status = status.to_ascii_uppercase();
+    if !FINAL_STATUSES.contains(&status.as_str()) {
+        return Err(StatusCode::BAD_REQUEST);
     }
+
+    match finalize(&state, id, &status).await {
+        Ok(sms) => Ok(Json(sms)),
+        Err(FinalizeError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(FinalizeError::AlreadyFinal) => Err(StatusCode::CONFLICT),
+    }
+}
+
+/// change the status of a sender ID registration
+async fn registration_status_handler(
+    Path((id, status)): Path<(Uuid, String)>,
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<Registration>, StatusCode> {
+    let status = status.to_ascii_uppercase();
+    if !REGISTRATION_STATUSES.contains(&status.as_str()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    match set_status(&state, id, &status).await {
+        Ok(registration) => Ok(Json(registration)),
+        Err(SetStatusError::NotFound) => Err(StatusCode::NOT_FOUND),
+        Err(SetStatusError::AlreadyFinal) => Err(StatusCode::CONFLICT),
+    }
+}
+
+/// return the Sinch mock configuration, shown in the UI
+async fn sinch_info_handler(Extension(state): Extension<Arc<AppState>>) -> Json<SinchInfo> {
+    Json(state.sinch.info())
+}
+
+/// change the Sinch mock settings, they apply to messages accepted from now on
+async fn sinch_settings_handler(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(settings): Json<SinchSettings>,
+) -> Result<Json<SinchInfo>, (StatusCode, String)> {
+    let settings = settings
+        .validate()
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    state.sinch.set_settings(settings);
+    info!("Sinch mock settings changed");
+
+    let info = state.sinch.info();
+    let _ = state.events.send(Event::Settings(info.clone()));
+
+    Ok(Json(info))
 }
 
 /// return version
@@ -298,6 +443,15 @@ pub async fn web_server(
             get(attachment_handler),
         )
         .route("/api/message/{id}/raw", get(message_raw_handler))
+        .route("/api/sms", get(sms_list_handler))
+        .route("/api/sms/{id}/status/{status}", post(sms_status_handler))
+        .route("/api/registrations", get(registrations_handler))
+        .route(
+            "/api/registration/{id}/status/{status}",
+            post(registration_status_handler),
+        )
+        .route("/api/sinch", get(sinch_info_handler))
+        .route("/api/sinch/settings", put(sinch_settings_handler))
         .nest_service("/static", get(static_handler))
         .layer(
             TraceLayer::new_for_http()
